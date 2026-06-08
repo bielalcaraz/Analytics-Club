@@ -1,6 +1,27 @@
 import json
 import anthropic
 
+_SYSTEM_PROMPT_PERSON_GROUPS = """Eres un asistente que analiza listas de nombres de personas en entornos industriales. Tu única tarea es detectar qué valores de la lista podrían referirse a la misma persona real, basándote SOLO en la información presente — nunca inventes apellidos ni completes iniciales.
+
+Reglas estrictas:
+- 'Pedro G.' y 'P.Garcia' → podrían ser la misma persona, propón 'Pedro G.' como forma canónica (la más completa disponible, sin inventar nada)
+- 'MARTINEZ J.' y 'J. Martinez' → mismo caso, propón 'J. Martinez'
+- 'Ana López' y 'ana lópez' → claramente la misma, propón 'Ana López'
+- Si no estás seguro, NO los agrupes
+- El nombre canónico propuesto debe ser uno de los valores originales de la lista, nunca uno inventado
+
+Devuelve SOLO JSON:
+{
+  "grupos": [
+    {
+      "valores": ["Pedro G.", "P.Garcia", "p.garcia"],
+      "nombre_canonico": "Pedro G.",
+      "confianza": "alta"
+    }
+  ]
+}
+Si no detectas grupos devuelve: {"grupos": []}"""
+
 SYSTEM_PROMPT_NORMALIZER = """Eres un experto en datos de fabricación metálica. Tu tarea es \
 normalizar valores de texto libre de una columna de datos industriales. Devuelve ÚNICAMENTE \
 un JSON válido sin texto adicional, donde cada clave es el valor original y el valor es \
@@ -74,3 +95,45 @@ def normalize_free_text(column_name: str, unique_values: list[str]) -> dict:
 
     except Exception:
         return {}
+
+
+def detect_person_groups(column_name: str, unique_values: list[str]) -> list[dict]:
+    """
+    Detecta grupos de valores que podrían ser la misma persona.
+    Devuelve lista de dicts con 'column_name', 'valores', 'nombre_canonico', 'confianza'.
+    El nombre_canonico siempre es uno de los valores originales.
+    """
+    if len(unique_values) < 2:
+        return []
+
+    try:
+        client = anthropic.Anthropic()
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=512,
+            system=_SYSTEM_PROMPT_PERSON_GROUPS,
+            messages=[{
+                "role": "user",
+                "content": f"Nombres en columna {column_name}: {json.dumps(unique_values, ensure_ascii=False)}",
+            }],
+        )
+        raw = response.content[0].text.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        data = json.loads(raw)
+        grupos = data.get("grupos", [])
+        valid = []
+        for g in grupos:
+            if (
+                isinstance(g, dict)
+                and isinstance(g.get("valores"), list)
+                and len(g["valores"]) >= 2
+                and g.get("nombre_canonico") in g["valores"]
+            ):
+                g["column_name"] = column_name
+                valid.append(g)
+        return valid
+    except Exception:
+        return []

@@ -258,13 +258,37 @@ def _detect_similar_refs(df: pd.DataFrame, mapping: MappingResult) -> dict:
     return result
 
 
+# Columnas de identificadores/códigos — nunca pasan por normalize_free_text
+_SKIP_NORM = (
+    "referencia", "id", "codigo", "orden", "maquina",
+    "descripcion", "observacion", "nota", "comentario", "detalle",
+)
+
+# Columnas de personas — solo strip + title case, nunca Claude
+_PERSON_COLS = (
+    "inspector", "tecnico", "operario", "responsable",
+    "nombre_inspector", "nombre_operario", "nombre_tecnico", "tecnico_responsable",
+)
+
+
+def _safe_map(orig, norm) -> str:
+    """Descarta la normalización si el valor es más de 3 chars más largo que el original."""
+    if pd.isna(orig) or pd.isna(norm):
+        return orig
+    if len(str(norm)) > len(str(orig)) + 3:
+        return orig
+    return norm
+
+
 def _normalize_text_columns(
     df: pd.DataFrame, mapping: MappingResult
 ) -> tuple[pd.DataFrame, dict]:
     """
     Para cada columna de tipo string con 2-30 valores únicos (sin contar nulos),
     llama a Claude para normalizar variaciones semánticas.
-    Omite columnas que ya tienen un dict 'valores' del mapeo inicial.
+    Columnas en _SKIP_NORM: ignoradas.
+    Columnas en _PERSON_COLS: solo strip + title case, nunca Claude.
+    Para el resto: Claude + validación de longitud (_safe_map).
     Devuelve el df modificado y el dict de cambios aplicados.
     """
     normalizaciones: dict = {}
@@ -274,15 +298,31 @@ def _normalize_text_columns(
             continue
         if col.destino not in df.columns:
             continue
-        if col.valores:   # ya normalizado en el paso anterior
+        if col.valores:
             continue
 
-        # No normalizar identificadores/códigos técnicos ni columnas de texto libre
-        _SKIP_NORM = (
-            "referencia", "id", "codigo", "orden", "maquina",
-            "descripcion", "observacion", "nota", "comentario", "detalle",
-        )
-        if any(kw in col.destino.lower() for kw in _SKIP_NORM):
+        dest = col.destino.lower()
+
+        if any(kw in dest for kw in _SKIP_NORM):
+            continue
+
+        # Columnas de persona: solo strip + title case, nunca Claude
+        if any(kw in dest for kw in _PERSON_COLS):
+            before = df[col.destino].copy()
+            df[col.destino] = (
+                df[col.destino]
+                .astype(str)
+                .str.strip()
+                .str.title()
+                .where(df[col.destino].notna(), df[col.destino])
+            )
+            changes = {
+                str(o): str(n)
+                for o, n in zip(before, df[col.destino])
+                if pd.notna(o) and str(o) != str(n)
+            }
+            if changes:
+                normalizaciones[col.destino] = changes
             continue
 
         unique_vals = [
@@ -296,20 +336,11 @@ def _normalize_text_columns(
         if not norm_dict:
             continue
 
-        # Para columnas de personas, descartar normalizaciones donde Claude
-        # haya inventado información (valor normalizado > original + 3 chars)
-        _PERSON_COLS = ("nombre", "inspector", "tecnico", "operario", "responsable")
-        if any(kw in col.destino.lower() for kw in _PERSON_COLS):
-            norm_dict = {
-                orig: (norm if norm is None or len(norm) <= len(orig) + 2 else orig)
-                for orig, norm in norm_dict.items()
-            }
-
-        df[col.destino] = df[col.destino].map(
-            lambda v, d=norm_dict: d.get(str(v), v) if pd.notna(v) else v
+        # Aplicar con seguro de longitud: si normalizado > original + 3 chars, descartar
+        df[col.destino] = df[col.destino].apply(
+            lambda x, d=norm_dict: _safe_map(x, d.get(str(x), x)) if pd.notna(x) else x
         )
 
-        # Solo incluir columnas donde hubo cambios reales
         changes = {k: v for k, v in norm_dict.items() if k != v}
         if changes:
             normalizaciones[col.destino] = changes

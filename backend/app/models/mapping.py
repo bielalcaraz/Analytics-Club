@@ -43,3 +43,16 @@ class UploadResponse(BaseModel):
 class ConfirmRequest(BaseModel):
     file_id: str
     mapping: MappingResult
+
+
+class PersonGroup(BaseModel):
+    column_name: str
+    valores: List[str]
+    nombre_canonico: str
+    confianza: str = "alta"
+
+
+class ReviewPersonsRequest(BaseModel):
+    columnas: List[str]
+    filas: List[dict]
+    grupos_confirmados: List[PersonGroup]

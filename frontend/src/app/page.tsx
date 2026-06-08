@@ -2,6 +2,7 @@
 import { useState, useCallback } from "react";
 import UploadZone from "@/components/UploadZone";
 import MappingReview from "@/components/MappingReview";
+import PersonReview from "@/components/PersonReview";
 import NormalizedTable from "@/components/NormalizedTable";
 
 export type ColumnMapping = {
@@ -27,6 +28,13 @@ export type UploadResponse = {
   total_rows: number;
 };
 
+export type PersonGroup = {
+  column_name: string;
+  valores: string[];
+  nombre_canonico: string;
+  confianza: "alta" | "media";
+};
+
 export type NormalizedData = {
   columnas: string[];
   filas: Record<string, unknown>[];
@@ -35,9 +43,10 @@ export type NormalizedData = {
   advertencias: string[];
   normalizaciones: Record<string, Record<string, string>>;
   posibles_duplicados: Record<string, string[][]>;
+  grupos_personas?: PersonGroup[];
 };
 
-type Step = "upload" | "review" | "result";
+type Step = "upload" | "review" | "person-review" | "result";
 
 export default function Home() {
   const [step, setStep] = useState<Step>("upload");
@@ -86,7 +95,12 @@ export default function Home() {
       }
       const data: NormalizedData = await res.json();
       setNormalizedData(data);
-      setStep("result");
+
+      if (data.grupos_personas && data.grupos_personas.length > 0) {
+        setStep("person-review");
+      } else {
+        setStep("result");
+      }
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Error desconocido");
     } finally {
@@ -94,12 +108,54 @@ export default function Home() {
     }
   }, [uploadData]);
 
+  const handlePersonReview = useCallback(async (gruposConfirmados: PersonGroup[]) => {
+    if (!normalizedData) return;
+    setLoading(true);
+    setError(null);
+
+    try {
+      // If no groups confirmed, skip the API call entirely
+      if (gruposConfirmados.length === 0) {
+        setStep("result");
+        return;
+      }
+
+      const res = await fetch("/api/review-persons", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          columnas: normalizedData.columnas,
+          filas: normalizedData.filas,
+          grupos_confirmados: gruposConfirmados,
+        }),
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.detail || "Error aplicando las unificaciones");
+      }
+      const updated = await res.json();
+      setNormalizedData((prev) =>
+        prev ? { ...prev, columnas: updated.columnas, filas: updated.filas, total_filas: updated.total_filas } : prev
+      );
+      setStep("result");
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : "Error desconocido");
+    } finally {
+      setLoading(false);
+    }
+  }, [normalizedData]);
+
   const handleReset = () => {
     setStep("upload");
     setUploadData(null);
     setNormalizedData(null);
     setError(null);
   };
+
+  // Map internal steps to the 3 visual steps
+  const visualStep = step === "result" ? "result" : step === "upload" ? "upload" : "review";
+  const visualSteps = ["upload", "review", "result"] as const;
+  const visualLabels = ["Subir Excel", "Revisar mapeo", "Datos normalizados"];
 
   return (
     <main className="max-w-5xl mx-auto px-4 py-10">
@@ -113,10 +169,11 @@ export default function Home() {
 
       {/* Steps indicator */}
       <div className="flex items-center gap-2 mb-8">
-        {(["upload", "review", "result"] as Step[]).map((s, i) => {
-          const labels = ["Subir Excel", "Revisar mapeo", "Datos normalizados"];
-          const active = step === s;
-          const done = (step === "review" && i === 0) || (step === "result" && i < 2);
+        {visualSteps.map((s, i) => {
+          const active = visualStep === s;
+          const done =
+            (visualStep === "review" && i === 0) ||
+            (visualStep === "result" && i < 2);
           return (
             <div key={s} className="flex items-center gap-2">
               <div className={`flex items-center gap-2 text-sm font-medium px-3 py-1.5 rounded-full transition-colors ${
@@ -125,7 +182,7 @@ export default function Home() {
                 "bg-gray-100 text-gray-400"
               }`}>
                 <span>{done ? "✓" : i + 1}</span>
-                <span>{labels[i]}</span>
+                <span>{visualLabels[i]}</span>
               </div>
               {i < 2 && <div className="w-6 h-px bg-gray-200" />}
             </div>
@@ -149,6 +206,13 @@ export default function Home() {
           uploadData={uploadData}
           onConfirm={handleConfirm}
           onBack={handleReset}
+          loading={loading}
+        />
+      )}
+      {step === "person-review" && normalizedData?.grupos_personas && (
+        <PersonReview
+          grupos={normalizedData.grupos_personas}
+          onConfirm={handlePersonReview}
           loading={loading}
         />
       )}

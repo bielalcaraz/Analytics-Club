@@ -13,7 +13,8 @@ load_dotenv(Path(__file__).parent / "backend" / ".env")
 
 from app.services.excel_reader import read_excel_safe, extract_sample, clean_structural_rows
 from app.services.claude_mapper import map_columns_with_claude
-from app.services.transformer import apply_mapping_with_warnings
+from app.services.transformer import apply_mapping_with_warnings, _PERSON_COLS
+from app.services.text_normalizer import detect_person_groups
 from app.models.mapping import MappingResult, ColumnMapping
 
 st.set_page_config(page_title="Dataplant — Pipeline test", layout="wide")
@@ -23,7 +24,7 @@ st.caption("Upload Excel → Claude mapea columnas → Python transforma")
 # ── Estado de sesión ─────────────────────────────────────────────────────────
 SESSION_KEYS = ("df_full", "mapping", "df_normalized", "sample_info",
                 "sheet_names", "duplicates_df", "df_with_selection", "normalizaciones",
-                "posibles_duplicados")
+                "posibles_duplicados", "grupos_personas", "grupos_referencias")
 for key in SESSION_KEYS:
     if key not in st.session_state:
         st.session_state[key] = None
@@ -177,6 +178,38 @@ if st.session_state.mapping is not None:
                         st.session_state.posibles_duplicados = posibles_duplicados
                         for w in warnings:
                             st.warning(w)
+
+                        # Detectar grupos de nombres de personas
+                        grupos = []
+                        for col in st.session_state.mapping.columnas:
+                            if col.tipo != "string":
+                                continue
+                            dest = col.destino
+                            if dest not in df_result.columns:
+                                continue
+                            if not any(kw in dest.lower() for kw in _PERSON_COLS):
+                                continue
+                            unique_vals = [
+                                str(v) for v in df_result[dest].dropna().unique()
+                                if str(v) not in ("", "nan", "None")
+                            ]
+                            if len(unique_vals) >= 2:
+                                grupos.extend(detect_person_groups(dest, unique_vals))
+                        st.session_state.grupos_personas = grupos
+
+                        # Convertir posibles_duplicados a formato interactivo
+                        grupos_refs = []
+                        for col_name, groups in posibles_duplicados.items():
+                            for group in groups:
+                                if len(group) >= 2:
+                                    grupos_refs.append({
+                                        "column_name": col_name,
+                                        "valores": list(group),
+                                        "nombre_canonico": group[0],
+                                        "confianza": "media",
+                                    })
+                        st.session_state.grupos_referencias = grupos_refs
+
                         st.rerun()
                     except Exception as e:
                         st.error(f"Error en la transformación: {e}")
@@ -185,7 +218,117 @@ if st.session_state.mapping is not None:
                 reset()
                 st.rerun()
 
-    # 3b — Resultado final
+    # 3b — Revisión combinada: personas + referencias de artículo
+    _gp = st.session_state.grupos_personas or []
+    _gr = st.session_state.grupos_referencias or []
+
+    if _gp or _gr:
+        total = len(_gp) + len(_gr)
+        st.subheader(f"Revisión de posibles duplicados — {total} grupo(s)")
+        st.info("Confirma cuáles son la misma entidad. Solo se unificarán los grupos que apruebes.")
+
+        # ── Nombres de personas ──────────────────────────────────────────────
+        if _gp:
+            st.markdown("#### 👤 Nombres de personas")
+            for i, grupo in enumerate(_gp):
+                with st.container(border=True):
+                    col_tag, col_conf = st.columns([3, 1])
+                    with col_tag:
+                        st.markdown(
+                            f"Columna **`{grupo['column_name']}`** — "
+                            "¿estas entradas son la misma persona?"
+                        )
+                    with col_conf:
+                        st.caption(f"confianza: {grupo['confianza']}")
+                    st.markdown(" · ".join(f"`{v}`" for v in grupo["valores"]))
+                    col_check, col_sel = st.columns([1, 3])
+                    with col_check:
+                        st.checkbox("Sí, unificar", value=True, key=f"persona_approve_{i}")
+                    with col_sel:
+                        if st.session_state.get(f"persona_approve_{i}", True):
+                            st.selectbox(
+                                "Nombre final:",
+                                options=grupo["valores"],
+                                index=grupo["valores"].index(grupo["nombre_canonico"]),
+                                key=f"persona_canonico_{i}",
+                            )
+
+        # ── Referencias de artículo ──────────────────────────────────────────
+        if _gr:
+            if _gp:
+                st.divider()
+            st.markdown("#### 🔖 Referencias de artículo")
+            for i, grupo in enumerate(_gr):
+                with st.container(border=True):
+                    col_tag, col_conf = st.columns([3, 1])
+                    with col_tag:
+                        st.markdown(
+                            f"Columna **`{grupo['column_name']}`** — "
+                            "¿estas referencias son el mismo artículo?"
+                        )
+                    with col_conf:
+                        st.caption(f"confianza: {grupo['confianza']}")
+                    st.markdown(" · ".join(f"`{v}`" for v in grupo["valores"]))
+                    col_check, col_sel = st.columns([1, 3])
+                    with col_check:
+                        st.checkbox("Sí, unificar", value=True, key=f"ref_approve_{i}")
+                    with col_sel:
+                        if st.session_state.get(f"ref_approve_{i}", True):
+                            st.selectbox(
+                                "Referencia final:",
+                                options=grupo["valores"],
+                                index=0,
+                                key=f"ref_canonico_{i}",
+                            )
+
+        st.divider()
+        col_a, col_b = st.columns([2, 1])
+        with col_a:
+            if st.button("Aplicar cambios confirmados", type="primary"):
+                df = st.session_state.df_normalized
+
+                for i, grupo in enumerate(_gp):
+                    if st.session_state.get(f"persona_approve_{i}", True):
+                        canonico = st.session_state.get(f"persona_canonico_{i}", grupo["nombre_canonico"])
+                        repl = {v: canonico for v in grupo["valores"] if v != canonico}
+                        if repl:
+                            df[grupo["column_name"]] = df[grupo["column_name"]].replace(repl)
+
+                for i, grupo in enumerate(_gr):
+                    if st.session_state.get(f"ref_approve_{i}", True):
+                        canonico = st.session_state.get(f"ref_canonico_{i}", grupo["valores"][0])
+                        repl = {v: canonico for v in grupo["valores"] if v != canonico}
+                        if repl:
+                            df[grupo["column_name"]] = df[grupo["column_name"]].replace(repl)
+
+                for i in range(len(_gp)):
+                    st.session_state.pop(f"persona_approve_{i}", None)
+                    st.session_state.pop(f"persona_canonico_{i}", None)
+                for i in range(len(_gr)):
+                    st.session_state.pop(f"ref_approve_{i}", None)
+                    st.session_state.pop(f"ref_canonico_{i}", None)
+
+                st.session_state.df_normalized = df
+                st.session_state.grupos_personas = []
+                st.session_state.grupos_referencias = []
+                st.session_state.posibles_duplicados = {}
+                st.rerun()
+
+        with col_b:
+            if st.button("Omitir todo"):
+                for i in range(len(_gp)):
+                    st.session_state.pop(f"persona_approve_{i}", None)
+                    st.session_state.pop(f"persona_canonico_{i}", None)
+                for i in range(len(_gr)):
+                    st.session_state.pop(f"ref_approve_{i}", None)
+                    st.session_state.pop(f"ref_canonico_{i}", None)
+                st.session_state.grupos_personas = []
+                st.session_state.grupos_referencias = []
+                st.rerun()
+
+        st.stop()
+
+    # 3c — Resultado final
     if st.session_state.df_normalized is not None:
         df_norm = st.session_state.df_normalized
         dups: pd.DataFrame | None = st.session_state.duplicates_df
