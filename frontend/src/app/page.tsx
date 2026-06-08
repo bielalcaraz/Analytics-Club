@@ -32,6 +32,9 @@ export type NormalizedData = {
   filas: Record<string, unknown>[];
   total_filas: number;
   schema: string;
+  advertencias: string[];
+  normalizaciones: Record<string, Record<string, string>>;
+  posibles_duplicados: Record<string, string[][]>;
 };
 
 type Step = "upload" | "review" | "result";

@@ -11,7 +11,7 @@ from app.services.excel_reader import (
     MAX_SIZE_BYTES,
 )
 from app.services.claude_mapper import map_columns_with_claude
-from app.services.transformer import apply_mapping, dataframe_to_json
+from app.services.transformer import apply_mapping_with_warnings, dataframe_to_json
 
 router = APIRouter()
 
@@ -91,8 +91,10 @@ async def confirm_mapping(body: ConfirmRequest):
         # Leer el Excel completo
         df = read_excel_safe(temp_path)
 
-        # Aplicar transformaciones con pandas (código determinista, sin IA)
-        df_normalizado = apply_mapping(df, body.mapping)
+        # Aplicar transformaciones + segunda pasada de normalización de texto
+        df_normalizado, advertencias, normalizaciones, posibles_duplicados = (
+            apply_mapping_with_warnings(df, body.mapping)
+        )
 
         # Convertir a JSON serializable
         rows = dataframe_to_json(df_normalizado)
@@ -102,6 +104,9 @@ async def confirm_mapping(body: ConfirmRequest):
             "filas": rows,
             "total_filas": len(rows),
             "schema": body.mapping.schema_detectado,
+            "advertencias": advertencias,
+            "normalizaciones": normalizaciones,
+            "posibles_duplicados": posibles_duplicados,
         }
 
     finally:

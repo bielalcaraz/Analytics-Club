@@ -1,83 +1,488 @@
+import re
 import pandas as pd
 from app.models.mapping import MappingResult, ColumnMapping
+from app.services.text_normalizer import normalize_free_text
+
+_DATE_FORMATS = [
+    "%d/%m/%y", "%d/%m/%Y",
+    "%d-%m-%y", "%d-%m-%Y",
+    "%m/%d/%y", "%m/%d/%Y",
+    "%Y-%m-%d",
+    "%B %d %Y", "%B %d, %Y",   # "January 4 2025", "January 4, 2025"
+    "%d %B %Y", "%d %B, %Y",   # "4 January 2025"
+]
+
+# Regex to split a cell like "3,45€/kg" or "850 u" into number + unit
+_EXTRACT_RE = re.compile(r"^\s*(?P<num>-?\d[\d.,]*)\s*(?P<unit>\S+)?\s*$")
+
+_UNIT_ALIASES: dict[str, str] = {
+    "u": "uds", "U": "uds", "ud": "uds", "Ud": "uds",
+}
+
+# Fallback para estado_stock: se aplica DESPUÉS del dict valores de Claude,
+# para cubrir valores que no aparecieron en la muestra de 10 filas.
+_ESTADO_STOCK_FALLBACK: dict[str, str] = {
+    "ok": "ok", "correcto": "ok", "normal": "ok", "bien": "ok", "disponible": "ok",
+    "bajo": "bajo", "bajo stock": "bajo", "poco stock": "bajo", "insuficiente": "bajo",
+    "critico": "critico", "crítico": "critico", "rojo": "critico",
+    "exceso": "exceso", "exceso stock": "exceso", "sobrestock": "exceso",
+    "exceso de stock": "exceso", "sobreabastecimiento": "exceso",
+    "bloqueado": "bloqueado", "retenido": "bloqueado", "inmovilizado": "bloqueado",
+    "cuarentena": "en_cuarentena", "en cuarentena": "en_cuarentena",
+    "qc hold": "en_cuarentena", "hold": "en_cuarentena",
+}
+
+
+def extract_value_and_unit(val) -> dict:
+    """
+    '3,45€/kg' → {'valor': 3.45, 'unidad': '€/kg'}
+    '850 u'    → {'valor': 850.0, 'unidad': 'uds'}
+    '0.85'     → {'valor': 0.85, 'unidad': None}
+    """
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return {"valor": None, "unidad": None}
+    s = str(val).strip()
+    if not s or s.lower() in ("nan", "none", ""):
+        return {"valor": None, "unidad": None}
+
+    m = _EXTRACT_RE.match(s)
+    if not m:
+        return {"valor": None, "unidad": None}
+
+    num_str = m.group("num")
+    raw_unit = (m.group("unit") or "").strip()
+
+    # Parse number: handle European format "1.200,00" and plain "3,45"
+    ns = num_str
+    if "." in ns and "," in ns:
+        ns = ns.replace(".", "").replace(",", ".")
+    else:
+        ns = ns.replace(",", ".")
+    try:
+        valor = float(ns)
+    except ValueError:
+        valor = None
+
+    if not raw_unit:
+        return {"valor": valor, "unidad": None}
+
+    # Normalize compound units (€/u → €/uds) and standalone aliases
+    unit = re.sub(r"/[uU]\b", "/uds", raw_unit)
+    unit = _UNIT_ALIASES.get(unit, unit)
+    return {"valor": valor, "unidad": unit or None}
 
 
 def apply_mapping(df: pd.DataFrame, mapping: MappingResult) -> pd.DataFrame:
-    """
-    Aplica el mapeo confirmado al DataFrame completo.
-    Código determinista — no hay IA aquí, solo pandas.
-    """
     result = df.copy()
 
     for col in mapping.columnas:
         if col.origen not in result.columns:
             continue
 
-        # 1. Aplicar limpieza previa si es necesaria
+        if getattr(col, "extraer_unidad", None):
+            extracted = result[col.origen].apply(extract_value_and_unit)
+            result[col.origen] = pd.to_numeric(
+                extracted.apply(lambda d: d["valor"]), errors="coerce"
+            )
+            result[col.origen + "_unidad"] = extracted.apply(lambda d: d["unidad"])
+            continue
+
         if col.limpieza:
             result[col.origen] = _apply_cleaning(result[col.origen], col.limpieza)
 
-        # 2. Convertir al tipo destino
         result[col.origen] = _convert_type(result[col.origen], col)
 
-    # 3. Renombrar columnas según mapeo
-    rename_map = {
-        c.origen: c.destino
-        for c in mapping.columnas
-        if c.origen in result.columns
-    }
+        if col.valores and col.tipo != "boolean":
+            # Para estado_stock, enriquecer el dict de Claude con el fallback canónico.
+            # Así los valores fuera de la muestra (ej: "exceso stock" en fila 23)
+            # quedan cubiertos aunque Claude no los haya visto.
+            mapping_dict = col.valores
+            if col.destino == "estado_stock":
+                # fallback tiene menor prioridad: Claude manda si tiene la clave
+                merged = {k: v for k, v in _ESTADO_STOCK_FALLBACK.items()}
+                merged.update({k: v for k, v in col.valores.items() if v is not None})
+                mapping_dict = merged
+            def _map_stock(v, m=mapping_dict):
+                if not isinstance(v, str) or v in ("None", "nan", ""):
+                    return None
+                return m.get(v.lower(), m.get(v, None))
+            result[col.origen] = result[col.origen].astype(str).str.strip().map(_map_stock)
+        elif col.destino == "estado_stock":
+            # Claude no generó valores dict para esta columna — aplicar fallback igualmente
+            def _map_stock_fallback(v):
+                if not isinstance(v, str) or v in ("None", "nan", ""):
+                    return None
+                return _ESTADO_STOCK_FALLBACK.get(v.lower().strip(), None)
+            result[col.origen] = result[col.origen].astype(str).str.strip().map(_map_stock_fallback)
+
+    rename_map = {}
+    for c in mapping.columnas:
+        if c.origen in result.columns:
+            rename_map[c.origen] = c.destino
+        if getattr(c, "extraer_unidad", None) and (c.origen + "_unidad") in result.columns:
+            rename_map[c.origen + "_unidad"] = c.destino + "_unidad"
     result = result.rename(columns=rename_map)
 
-    # 4. Mantener solo columnas mapeadas (descartar las no reconocidas)
-    destino_cols = [c.destino for c in mapping.columnas if c.origen in df.columns]
-    result = result[destino_cols]
+    destino_cols = []
+    for c in mapping.columnas:
+        if c.origen in df.columns:
+            destino_cols.append(c.destino)
+            if getattr(c, "extraer_unidad", None):
+                destino_cols.append(c.destino + "_unidad")
+    result = result[[col for col in destino_cols if col in result.columns]]
+
+    result = _drop_garbage_rows(result)
 
     return result
 
 
+def apply_mapping_with_warnings(
+    df: pd.DataFrame, mapping: MappingResult
+) -> tuple[pd.DataFrame, list[str], dict, dict]:
+    """
+    Pipeline completo:
+    1. apply_mapping  — rename, tipos, limpieza, valores dict
+    2. _normalize_text_columns  — segunda llamada a Claude para texto libre
+    3. Detección de duplicados exactos
+    4. Detección de referencias similares (Levenshtein)
+    Devuelve (df, advertencias, normalizaciones, posibles_duplicados).
+    """
+    result = apply_mapping(df, mapping)
+
+    # Segunda llamada a Claude: normalizar texto libre
+    result, normalizaciones = _normalize_text_columns(result, mapping)
+
+    # Detectar duplicados exactos
+    warnings: list[str] = []
+    n_before = len(result)
+    result = result.drop_duplicates(keep="first").reset_index(drop=True)
+    n_removed = n_before - len(result)
+    if n_removed > 0:
+        warnings.append(
+            f"Se encontraron {n_removed} fila(s) duplicada(s) y fueron eliminadas"
+        )
+
+    # Detectar referencias similares (posibles alias del mismo artículo)
+    posibles_duplicados = _detect_similar_refs(result, mapping)
+
+    return result, warnings, normalizaciones, posibles_duplicados
+
+
+def _levenshtein(a: str, b: str) -> int:
+    """Distancia de edición entre dos strings (Levenshtein)."""
+    if len(a) < len(b):
+        a, b = b, a
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for ca in a:
+        curr = [prev[0] + 1]
+        for j, cb in enumerate(b):
+            curr.append(min(prev[j + 1] + 1, curr[j] + 1, prev[j] + (ca != cb)))
+        prev = curr
+    return prev[-1]
+
+
+_SEQUENTIAL_ID_RE = re.compile(r"^[A-Z]+-\d+$|^[A-Z]+\d+$")
+
+
+def _is_sequential_id_column(vals: list[str]) -> bool:
+    """True si >70% de los valores siguen un patrón de ID secuencial (ART-001, OF-2841...)."""
+    if not vals:
+        return False
+    matches = sum(1 for v in vals if _SEQUENTIAL_ID_RE.match(v))
+    return matches / len(vals) > 0.70
+
+
+def _detect_similar_refs(df: pd.DataFrame, mapping: MappingResult) -> dict:
+    """
+    Para columnas de referencia / part_number, detecta grupos de valores con
+    distancia Levenshtein <= 3 — posibles alias del mismo artículo.
+    Omite columnas con IDs secuenciales (ART-001, OF-2841) donde la similitud
+    es estructural, no semántica.
+    Devuelve {col_name: [[grupo1_val1, val2, ...], [grupo2_val1, ...]]}
+    """
+    REF_COLS = re.compile(r"referencia|part_number|part_no|codigo_articulo", re.IGNORECASE)
+    result: dict = {}
+
+    for col in mapping.columnas:
+        if col.tipo != "string":
+            continue
+        if not REF_COLS.search(col.destino):
+            continue
+        if col.destino not in df.columns:
+            continue
+
+        vals = [
+            str(v) for v in df[col.destino].dropna().unique()
+            if str(v) not in ("", "nan", "None")
+        ]
+        if len(vals) < 2 or len(vals) > 200:
+            continue
+
+        # Saltar columnas de IDs secuenciales (ART-001, ART-002...) — la
+        # similitud es por prefijo compartido, no por ser el mismo artículo
+        if _is_sequential_id_column(vals):
+            continue
+
+        # Grafo de adyacencia: par de valores con distancia <= 3
+        adj: dict[str, set] = {v: set() for v in vals}
+        for i in range(len(vals)):
+            for j in range(i + 1, len(vals)):
+                if _levenshtein(vals[i], vals[j]) <= 3:
+                    adj[vals[i]].add(vals[j])
+                    adj[vals[j]].add(vals[i])
+
+        # Componentes conexas (BFS)
+        visited: set = set()
+        groups: list = []
+        for v in vals:
+            if v in visited:
+                continue
+            visited.add(v)
+            if not adj[v]:
+                continue
+            group = [v]
+            queue = list(adj[v] - visited)
+            while queue:
+                node = queue.pop()
+                if node in visited:
+                    continue
+                visited.add(node)
+                group.append(node)
+                queue.extend(adj[node] - visited)
+            if len(group) > 1:
+                groups.append(sorted(group))
+
+        if groups:
+            result[col.destino] = groups
+
+    return result
+
+
+def _normalize_text_columns(
+    df: pd.DataFrame, mapping: MappingResult
+) -> tuple[pd.DataFrame, dict]:
+    """
+    Para cada columna de tipo string con 2-30 valores únicos (sin contar nulos),
+    llama a Claude para normalizar variaciones semánticas.
+    Omite columnas que ya tienen un dict 'valores' del mapeo inicial.
+    Devuelve el df modificado y el dict de cambios aplicados.
+    """
+    normalizaciones: dict = {}
+
+    for col in mapping.columnas:
+        if col.tipo != "string":
+            continue
+        if col.destino not in df.columns:
+            continue
+        if col.valores:   # ya normalizado en el paso anterior
+            continue
+
+        # No normalizar identificadores/códigos técnicos ni columnas de texto libre
+        _SKIP_NORM = (
+            "referencia", "id", "codigo", "orden", "maquina",
+            "descripcion", "observacion", "nota", "comentario", "detalle",
+        )
+        if any(kw in col.destino.lower() for kw in _SKIP_NORM):
+            continue
+
+        unique_vals = [
+            str(v) for v in df[col.destino].dropna().unique()
+            if str(v) not in ("", "nan", "None")
+        ]
+        if not (2 <= len(unique_vals) <= 30):
+            continue
+
+        norm_dict = normalize_free_text(col.destino, unique_vals)
+        if not norm_dict:
+            continue
+
+        df[col.destino] = df[col.destino].map(
+            lambda v, d=norm_dict: d.get(str(v), v) if pd.notna(v) else v
+        )
+
+        # Solo incluir columnas donde hubo cambios reales
+        changes = {k: v for k, v in norm_dict.items() if k != v}
+        if changes:
+            normalizaciones[col.destino] = changes
+
+    return df, normalizaciones
+
+
+# ── Limpieza ──────────────────────────────────────────────────────────────────
+
 def _apply_cleaning(series: pd.Series, limpieza: str) -> pd.Series:
-    """Limpieza de texto antes de la conversión de tipo."""
     s = series.astype(str)
 
     if limpieza == "quitar_pct":
-        s = s.str.replace("%", "", regex=False).str.replace(",", ".", regex=False).str.strip()
+        # Normaliza a fracción decimal (0-1):
+        #   "2,3%"  → 0.023  (quitar %, dividir entre 100)
+        #   "0.034" → 0.034  (ya es fracción, dejar igual)
+        #   "2"     → 0.02   (asumir porcentaje, dividir entre 100)
+        return s.apply(_normalize_pct)
+
     elif limpieza == "quitar_euro":
-        s = s.str.replace("€", "", regex=False).str.replace(",", ".", regex=False).str.strip()
+        # Remove trailing € (and any unit suffix after it, e.g. "€/kg")
+        s = s.str.replace(r"[€$][^\d]*$", "", regex=True)
+        # Remove leading currency prefix (e.g. "EUR 315" → "315")
+        s = s.str.replace(r"^[^\d]*", "", regex=True)
+        return s.str.replace(",", ".", regex=False).str.strip()
+
+    elif limpieza in ("quitar_unidad", "quitar_unidades"):
+        # "850 u" → "850", "415 kg" → "415", "1.200 pcs" → "1200"
+        extracted = s.str.extract(r"^([\d\s\.,\-]+)", expand=False).str.strip()
+        return extracted.str.replace(",", ".", regex=False)
+
     elif limpieza == "strip":
-        s = s.str.strip()
+        return s.str.strip()
 
     return s
 
 
+def _normalize_pct(val) -> str | None:
+    """Convierte cualquier representación de porcentaje a fracción decimal."""
+    s = str(val).strip() if val is not None else ""
+    if not s or s.lower() in ("nan", "none", ""):
+        return None
+    has_pct = "%" in s
+    s = s.replace("%", "").replace(",", ".").strip()
+    try:
+        num = float(s)
+        if has_pct:
+            return str(num / 100)
+        elif 0.0 <= num <= 1.0:
+            return str(num)
+        else:
+            return str(num / 100)
+    except (ValueError, OverflowError):
+        return str(val)
+
+
+# ── Conversión de tipos ───────────────────────────────────────────────────────
+
 def _convert_type(series: pd.Series, col: ColumnMapping) -> pd.Series:
-    """Convierte la serie al tipo de dato correcto."""
     try:
         if col.tipo == "float":
-            return pd.to_numeric(series, errors="coerce")
+            return pd.to_numeric(_fix_numeric(series), errors="coerce")
         elif col.tipo == "integer":
-            return pd.to_numeric(series, errors="coerce").astype("Int64")
-        elif col.tipo == "date" and col.formato:
-            return pd.to_datetime(series, format=col.formato, errors="coerce")
+            return pd.to_numeric(_fix_numeric(series), errors="coerce").astype("Int64")
+        elif col.tipo == "date":
+            return _parse_dates_robust(series, hint_format=col.formato)
+
         elif col.tipo == "boolean":
-            return series.map(
-                lambda x: True if str(x).lower() in ("1", "si", "sí", "yes", "true", "s")
-                else False if str(x).lower() in ("0", "no", "false", "n")
-                else None
-            )
+            _TRUE  = {"1", "si", "sí", "yes", "true", "s", "t", "verdadero", "v"}
+            _FALSE = {"0", "no", "false", "n", "f", "falso"}
+            def _bool_str(x):
+                v = str(x).lower().strip()
+                if v in _TRUE:
+                    return "si"
+                if v in _FALSE:
+                    return "no"
+                return None
+            return series.map(_bool_str)
         else:
             return series.astype(str).replace("nan", None)
     except Exception:
         return series
 
 
-def dataframe_to_json(df: pd.DataFrame) -> list[dict]:
-    """Convierte el DataFrame normalizado a JSON serializable."""
-    result = df.copy()
+def _fix_numeric(series: pd.Series) -> pd.Series:
+    """
+    Normaliza separadores numéricos europeos antes de pd.to_numeric.
+    - "1.200"  → "1200"  (miles con punto, solo si primer dígito es 1-9)
+    - "1,5"   → "1.5"
+    - "0.034" → "0.034"  (NO se toca — es un decimal, no miles)
+    """
+    # Patrón de miles: empieza con 1-9, luego grupos de .DDD
+    THOUSANDS_RE = re.compile(r"^[1-9]\d{0,2}(\.\d{3})+$")
 
+    def fix(val):
+        if pd.isna(val):
+            return val
+        s = str(val).strip()
+        if not s or s.lower() == "nan":
+            return None
+        if THOUSANDS_RE.match(s):
+            return s.replace(".", "")   # "1.200" → "1200"
+        return s.replace(",", ".")      # decimal con coma → punto
+
+    return series.apply(fix)
+
+
+def _parse_dates_robust(series: pd.Series, hint_format: str | None = None) -> pd.Series:
+    # openpyxl may already have parsed dates as datetime64 — return directly
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return series
+
+    result = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
+    s = series.astype(str).str.strip()
+
+    # Excel serial numbers: pd.to_numeric detects both "45780" and "45780.0"
+    # Range 20000–60000 ≈ years 1954–2064
+    numeric_s = pd.to_numeric(s, errors="coerce")
+    serial_mask = result.isna() & numeric_s.notna() & (numeric_s >= 20000) & (numeric_s <= 60000)
+    if serial_mask.any():
+        excel_epoch = pd.Timestamp("1899-12-30")
+        def serial_to_date(v):
+            try:
+                return excel_epoch + pd.Timedelta(days=int(float(v)))
+            except Exception:
+                return pd.NaT
+        result[serial_mask] = s[serial_mask].apply(serial_to_date).values
+
+    # hint_format es válido solo si es un único código strptime (no una descripción como
+    # "mixto: %d/%m/%y, %d-%m-%Y, ..." que Claude a veces devuelve)
+    _valid_hint = (
+        hint_format is not None
+        and "%" in hint_format
+        and len(hint_format) <= 30
+        and "," not in hint_format
+    )
+    formats = (
+        ([hint_format] if _valid_hint else [])
+        + _DATE_FORMATS
+        + ["%Y-%m-%d %H:%M:%S"]
+    )
+
+    for fmt in formats:
+        pending = result.isna() & s.notna() & (s != "") & (s != "nan") & (s != "NaT")
+        if not pending.any():
+            break
+        parsed = pd.to_datetime(s[pending], format=fmt, errors="coerce")
+        filled = parsed.notna()
+        if filled.any():
+            result[pending & filled.reindex(result.index, fill_value=False)] = parsed[filled].values
+
+    # Final fallback: pandas auto-parser for any remaining unparsed values
+    # (handles unusual formats like "January 4 2025" not covered above)
+    pending = result.isna() & s.notna() & (s != "") & (s != "nan") & (s != "NaT")
+    if pending.any():
+        parsed = pd.to_datetime(s[pending], errors="coerce", dayfirst=True)
+        filled = parsed.notna()
+        if filled.any():
+            result[pending & filled.reindex(result.index, fill_value=False)] = parsed[filled].values
+
+    return result
+
+
+def _drop_garbage_rows(df: pd.DataFrame) -> pd.DataFrame:
+    all_null = df.isnull().all(axis=1)
+    GARBAGE_PATTERNS = r">>|TOTAL|SUBTOTAL|PARCIAL"
+    str_cols = df.select_dtypes(include="object").columns
+    is_garbage = pd.Series(False, index=df.index)
+    for col in str_cols:
+        is_garbage |= df[col].astype(str).str.contains(
+            GARBAGE_PATTERNS, case=False, na=False, regex=True
+        )
+    return df[~all_null & ~is_garbage].reset_index(drop=True)
+
+
+def dataframe_to_json(df: pd.DataFrame) -> list[dict]:
+    result = df.copy()
     for col in result.columns:
-        if result[col].dtype == "datetime64[ns]":
+        if pd.api.types.is_datetime64_any_dtype(result[col]):
             result[col] = result[col].dt.strftime("%Y-%m-%d").where(result[col].notna(), None)
         elif hasattr(result[col], "dtype") and str(result[col].dtype) == "Int64":
             result[col] = result[col].astype(object).where(result[col].notna(), None)
-
     return result.where(result.notna(), None).to_dict(orient="records")
