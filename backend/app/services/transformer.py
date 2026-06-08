@@ -1,4 +1,6 @@
 import re
+import json
+import anthropic
 import pandas as pd
 from app.models.mapping import MappingResult, ColumnMapping
 from app.services.text_normalizer import normalize_free_text
@@ -168,38 +170,67 @@ def apply_mapping_with_warnings(
     return result, warnings, normalizaciones, posibles_duplicados
 
 
-def _levenshtein(a: str, b: str) -> int:
-    """Distancia de edición entre dos strings (Levenshtein)."""
-    if len(a) < len(b):
-        a, b = b, a
-    if not b:
-        return len(a)
-    prev = list(range(len(b) + 1))
-    for ca in a:
-        curr = [prev[0] + 1]
-        for j, cb in enumerate(b):
-            curr.append(min(prev[j + 1] + 1, curr[j] + 1, prev[j] + (ca != cb)))
-        prev = curr
-    return prev[-1]
+_SYSTEM_PROMPT_DUPDETECT = """\
+Eres un experto en referencias de artículos industriales del sector metal. \
+Tu tarea es identificar referencias que sean genuinamente el mismo artículo \
+escrito de formas distintas.
+
+REGLAS CRÍTICAS:
+- Referencias de la misma familia pero distinto tamaño/diámetro/medida NO son \
+duplicados: VLV-DN25, VLV-DN50, VLV-DN80 son válvulas distintas. \
+BRD-1", BRD-3/4" son bridas distintas. COD-45-INX, COD-90-INX son codos distintos.
+- SÍ son duplicados: PN-4521-A y 4521-A y PN4521A (mismo código con/sin prefijo). \
+CIL-8800 y 8800-CIL (mismo código invertido). \
+REF-001 y ref-001 (mismo código distinta capitalización).
+- Si tienes dudas, NO lo marques como duplicado. Solo marca los casos donde \
+estás seguro al 90%+ de que es el mismo artículo.
+
+Devuelve ÚNICAMENTE un JSON válido:
+{"grupos_duplicados": [["valor_a", "valor_b"], ["valor_c", "valor_d", "valor_e"]]}
+Si no hay duplicados reales devuelve: {"grupos_duplicados": []}
+Sin texto adicional, solo JSON.\
+"""
 
 
-_SEQUENTIAL_ID_RE = re.compile(r"^[A-Z]+-\d+$|^[A-Z]+\d+$")
-
-
-def _is_sequential_id_column(vals: list[str]) -> bool:
-    """True si >70% de los valores siguen un patrón de ID secuencial (ART-001, OF-2841...)."""
-    if not vals:
-        return False
-    matches = sum(1 for v in vals if _SEQUENTIAL_ID_RE.match(v))
-    return matches / len(vals) > 0.70
+def _detect_duplicates_with_claude(
+    column_name: str, unique_values: list[str]
+) -> list[list[str]]:
+    """
+    Llama a Claude para identificar referencias que son el mismo artículo
+    escrito de formas distintas. Devuelve lista de grupos, o [] si no hay.
+    """
+    try:
+        client = anthropic.Anthropic()
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=512,
+            system=_SYSTEM_PROMPT_DUPDETECT,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Columna: {column_name}\n"
+                    f"Valores únicos: {json.dumps(unique_values, ensure_ascii=False)}"
+                ),
+            }],
+        )
+        raw = response.content[0].text.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        data = json.loads(raw)
+        groups = data.get("grupos_duplicados", [])
+        # Filtrar grupos con menos de 2 elementos (respuesta mal formada)
+        return [g for g in groups if isinstance(g, list) and len(g) >= 2]
+    except Exception:
+        return []
 
 
 def _detect_similar_refs(df: pd.DataFrame, mapping: MappingResult) -> dict:
     """
-    Para columnas de referencia / part_number, detecta grupos de valores con
-    distancia Levenshtein <= 3 — posibles alias del mismo artículo.
-    Omite columnas con IDs secuenciales (ART-001, OF-2841) donde la similitud
-    es estructural, no semántica.
+    Para columnas de referencia / part_number, llama a Claude para detectar
+    referencias que son el mismo artículo escrito de formas distintas.
+    Ignora columnas con más de 50 valores únicos (IDs secuenciales).
     Devuelve {col_name: [[grupo1_val1, val2, ...], [grupo2_val1, ...]]}
     """
     REF_COLS = re.compile(r"referencia|part_number|part_no|codigo_articulo", re.IGNORECASE)
@@ -217,43 +248,10 @@ def _detect_similar_refs(df: pd.DataFrame, mapping: MappingResult) -> dict:
             str(v) for v in df[col.destino].dropna().unique()
             if str(v) not in ("", "nan", "None")
         ]
-        if len(vals) < 2 or len(vals) > 200:
+        if len(vals) < 2 or len(vals) > 50:
             continue
 
-        # Saltar columnas de IDs secuenciales (ART-001, ART-002...) — la
-        # similitud es por prefijo compartido, no por ser el mismo artículo
-        if _is_sequential_id_column(vals):
-            continue
-
-        # Grafo de adyacencia: par de valores con distancia <= 3
-        adj: dict[str, set] = {v: set() for v in vals}
-        for i in range(len(vals)):
-            for j in range(i + 1, len(vals)):
-                if _levenshtein(vals[i], vals[j]) <= 3:
-                    adj[vals[i]].add(vals[j])
-                    adj[vals[j]].add(vals[i])
-
-        # Componentes conexas (BFS)
-        visited: set = set()
-        groups: list = []
-        for v in vals:
-            if v in visited:
-                continue
-            visited.add(v)
-            if not adj[v]:
-                continue
-            group = [v]
-            queue = list(adj[v] - visited)
-            while queue:
-                node = queue.pop()
-                if node in visited:
-                    continue
-                visited.add(node)
-                group.append(node)
-                queue.extend(adj[node] - visited)
-            if len(group) > 1:
-                groups.append(sorted(group))
-
+        groups = _detect_duplicates_with_claude(col.destino, vals)
         if groups:
             result[col.destino] = groups
 
