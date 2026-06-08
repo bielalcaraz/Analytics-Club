@@ -22,6 +22,16 @@ Regla especial para NOMBRES DE EMPRESA Y PROVEEDOR:
 - Ejemplo: 'METALPRO', 'MetalPro S.A.', 'metalpro sa' → 'MetalPro S.A.'
 - Conserva siglas jurídicas si aparecen en alguna variante: S.L., S.A., S.L.U., etc.
 
+Regla especial para NOMBRES DE PERSONAS (operario, inspector, técnico, responsable):
+- NUNCA completes ni inventes apellidos a partir de iniciales.
+  'Pedro G.' → 'Pedro G.' (no puedes saber si es García, González o Gutiérrez)
+  'P.Garcia' → 'P. Garcia' (solo añadir espacio tras el punto)
+  'MARTINEZ J.' → 'Martinez J.' (solo corregir capitalización)
+- Solo puedes: corregir capitalización, añadir espacio tras punto, eliminar espacios dobles.
+- Si dos valores podrían ser la misma persona pero no estás seguro al 100%, \
+devuelve cada uno tal cual — no los unifiques.
+- El valor normalizado NUNCA debe ser más largo que el original.
+
 - NUNCA modifiques códigos de producto, referencias de artículo, IDs de máquina, números de orden \
 ni cualquier valor alfanumérico que parezca un código técnico (contiene guiones con números o \
 letras en mayúsculas tipo TRN-04, VLV-DN50, OF-2841). Solo normaliza campos semánticos como \

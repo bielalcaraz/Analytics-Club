@@ -296,6 +296,15 @@ def _normalize_text_columns(
         if not norm_dict:
             continue
 
+        # Para columnas de personas, descartar normalizaciones donde Claude
+        # haya inventado información (valor normalizado > original + 3 chars)
+        _PERSON_COLS = ("nombre", "inspector", "tecnico", "operario", "responsable")
+        if any(kw in col.destino.lower() for kw in _PERSON_COLS):
+            norm_dict = {
+                orig: (norm if norm is None or len(norm) <= len(orig) + 2 else orig)
+                for orig, norm in norm_dict.items()
+            }
+
         df[col.destino] = df[col.destino].map(
             lambda v, d=norm_dict: d.get(str(v), v) if pd.notna(v) else v
         )
