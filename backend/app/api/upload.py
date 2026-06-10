@@ -14,6 +14,7 @@ from app.services.excel_reader import (
 from app.services.claude_mapper import map_columns_with_claude
 from app.services.transformer import apply_mapping_with_warnings, dataframe_to_json, _PERSON_COLS
 from app.services.text_normalizer import detect_person_groups
+from app.services.schema_validator import validate_and_standardize, SchemaValidationError
 
 router = APIRouter()
 
@@ -85,6 +86,16 @@ async def confirm_mapping(body: ConfirmRequest):
         df_normalizado, advertencias, normalizaciones, posibles_duplicados = (
             apply_mapping_with_warnings(df, body.mapping)
         )
+
+        # Validación final de esquema canónico: garantiza columnas estándar
+        # para que los dashboards funcionen igual independientemente de la empresa
+        try:
+            df_normalizado, schema_warnings = validate_and_standardize(
+                df_normalizado, body.mapping.schema_detectado
+            )
+        except SchemaValidationError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+        advertencias.extend(schema_warnings)
 
         # Detectar grupos de nombres de personas para revisión manual
         grupos_personas = []

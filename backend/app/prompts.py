@@ -40,11 +40,28 @@ porque pueden aparecer en filas fuera de la muestra:
 - "bloqueado" → "bloqueado", "BLOQUEADO" → "bloqueado", "retenido" → "bloqueado"
 - "cuarentena" → "en_cuarentena", "en cuarentena" → "en_cuarentena", "EN CUARENTENA" → "en_cuarentena"
 
-Para columnas de TURNO, normaliza siempre a A/B/C:
-- "A" → para: A, mañana, morning, 1, turno1
-- "B" → para: B, tarde, afternoon, 2, turno2
-- "C" → para: C, noche, night, 3, turno3
+Para turno usa siempre: turno_a | turno_b | turno_c | turno_manana | turno_tarde | turno_noche.
+- "turno_a" → para: A, a, 1, M, Mañana
+- "turno_b" → para: B, b, 2, T, Tarde
+- "turno_c" → para: C, c, 3, N, Noche
 - Cualquier valor que claramente NO sea un turno (nombre de persona, código de máquina, etc.) NO lo incluyas en el dict — quedará null, indicando dato incorrecto en la fuente.
+
+Para columnas de TIPO DE DEFECTO (tipo_defecto), normaliza siempre a estos valores estándar:
+- porosidad → para: porosidad, POROSIDAD, poros, porosidad superficial, Porosidad superficial
+- rugosidad → para: rugosidad, RUGOSIDAD, Rugosidad, Rugos. excesiva, rugosidad superficial, Rugosidad superficial, Rugosidad excesiva
+- dimension → para: Dimension fuera tol., DIM. FUERA, dim. mal, Dimensión incorrecta, fura tolerancia
+- grieta → para: Grieta, GRIETA, micro-grieta, fisura
+- sin_defecto → para: OK, ok, Correcto, PASS
+
+Para resultado_inspeccion usa siempre: aprobado | rechazado | pendiente.
+- aprobado → para: OK, ok, PASS, Aceptado, Correcto
+- rechazado → para: NOK, nok, FAIL, Rechazado
+- pendiente → para: pendiente, PENDIENTE
+
+Para linea_produccion normaliza a formato L1, L2, L3 (sin guión):
+- L-1, Linea1, LINEA_1 → L1
+- L-2, Linea2, LINEA_2 → L2
+- L-3, Linea3, LINEA_3 → L3
 
 Esquemas posibles para schema_detectado:
 - ordenes_produccion: datos de órdenes de fabricación
@@ -52,6 +69,16 @@ Esquemas posibles para schema_detectado:
 - mantenimiento: registros de averías y mantenimiento
 - calidad: controles e inspecciones de calidad
 - otro: si no encaja en ninguna categoría
+
+NOMBRES DESTINO ESTÁNDAR (esquema canónico):
+Cuando mapees columnas, usa siempre estos nombres destino estándar si el significado coincide:
+
+- ordenes_produccion: numero_orden_fabricacion, referencia_articulo, fecha_orden_fabricacion, cantidad_fabricada, tasa_scrap, estado_orden_fabricacion, tiempo_ciclo, turno, maquina_id, coste, kg_materia_prima, observaciones
+- inventario: codigo_articulo, descripcion, stock_actual, stock_unidad, estado_stock, stock_minimo, stock_maximo, precio_coste, precio_coste_unidad, proveedor_principal, ubicacion, ultima_entrada, ultima_salida
+- mantenimiento: id_averia, maquina_afectada, fecha_averia, tipo_mantenimiento, resuelta, tiempo_parada_horas, coste_reparacion, prioridad, descripcion_averia, tecnico_responsable
+- calidad: id_inspeccion, referencia_articulo, fecha_inspeccion, resultado_inspeccion, cantidad_inspeccionada, cantidad_rechazada, tipo_defecto, linea_produccion, nombre_inspector, accion_correctiva, tiempo_inspeccion_horas, turno
+
+Solo usa estos nombres cuando el significado de la columna origen coincida claramente. Si una columna no encaja en ninguno de estos nombres estándar, usa un nombre snake_case descriptivo propio.
 
 Estructura JSON de respuesta:
 {
@@ -106,7 +133,7 @@ Ejemplo para columna de turno con valor incorrecto (Juan es un operario, no un t
   "destino": "turno",
   "tipo": "string",
   "limpieza": null,
-  "valores": {"A": "A", "B": "B", "C": "C"},
+  "valores": {"A": "turno_a", "B": "turno_b", "C": "turno_c"},
   "confianza": "alta",
   "nota": "Se detectó 'Juan' (nombre de operario) — quedará null al no ser un turno válido"
 }"""
