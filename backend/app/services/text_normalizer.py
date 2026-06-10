@@ -33,7 +33,8 @@ Reglas generales:
 - Para estados de órdenes de fabricación usa siempre:
   completada | en_curso | bloqueada | pendiente | cancelada
 - Para turnos usa siempre: turno_a | turno_b | turno_c | turno_manana | turno_tarde | turno_noche
-- Para resultados de calidad usa siempre: ok | nok | pendiente
+- Para resultado_inspeccion usa siempre: aprobado | rechazado | pendiente. \
+Los valores OK, ok, PASS, Aceptado, Correcto → aprobado. NOK, nok, FAIL, Rechazado → rechazado.
 - Si no puedes determinar el significado con certeza, devuelve el valor tal cual
 
 Regla especial para NOMBRES DE EMPRESA Y PROVEEDOR:
